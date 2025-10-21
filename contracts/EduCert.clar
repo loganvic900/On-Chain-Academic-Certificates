@@ -36,12 +36,40 @@
     { certificate-id: uint }
 )
 
+(define-data-var revocation-event-counter uint u0)
+
+(define-map revocation-events
+    { event-id: uint }
+    {
+        revoker: principal,
+        timestamp: uint,
+        certificates-count: uint
+    }
+)
+
+(define-map certificate-revocation-link
+    { certificate-id: uint }
+    { event-id: uint }
+)
+
 (define-read-only (get-contract-owner)
     CONTRACT-OWNER
 )
 
 (define-read-only (is-authorized-institution (institution principal))
     (default-to false (map-get? authorized-institutions institution))
+)
+
+(define-read-only (get-revocation-event (event-id uint))
+    (map-get? revocation-events { event-id: event-id })
+)
+
+(define-read-only (get-total-revocation-events)
+    (var-get revocation-event-counter)
+)
+
+(define-read-only (get-certificate-revocation-event (certificate-id uint))
+    (map-get? certificate-revocation-link { certificate-id: certificate-id })
 )
 
 (define-read-only (get-certificate (certificate-id uint))
@@ -153,6 +181,55 @@
         
         (var-set next-certificate-id (+ certificate-id u1))
         (ok certificate-id)
+    )
+)
+
+(define-public (revoke-certificates-batch (certificate-ids (list 20 uint)))
+    (let
+        (
+            (list-length (len certificate-ids))
+            (caller tx-sender)
+            (current-block stacks-block-height)
+            (event-id (var-get revocation-event-counter))
+        )
+        (asserts! (or (is-eq caller CONTRACT-OWNER) (is-authorized-institution caller)) ERR-UNAUTHORIZED)
+        (asserts! (> list-length u0) ERR-INVALID-INPUT)
+        (asserts! (<= list-length u20) ERR-INVALID-INPUT)
+        
+        (fold revoke-and-link certificate-ids u0)
+        
+        (map-set revocation-events
+            { event-id: event-id }
+            {
+                revoker: caller,
+                timestamp: current-block,
+                certificates-count: list-length
+            }
+        )
+        
+        (var-set revocation-event-counter (+ event-id u1))
+        (ok event-id)
+    )
+)
+
+(define-private (revoke-and-link (cert-id uint) (count uint))
+    (match (get-certificate cert-id)
+        certificate
+        (if (not (get is-revoked certificate))
+            (begin
+                (map-set certificates
+                    { certificate-id: cert-id }
+                    (merge certificate { is-revoked: true })
+                )
+                (map-set certificate-revocation-link
+                    { certificate-id: cert-id }
+                    { event-id: (var-get revocation-event-counter) }
+                )
+                (+ count u1)
+            )
+            count
+        )
+        count
     )
 )
 

@@ -1,5 +1,6 @@
 ;; EduCert - On-Chain Academic Certificates
 ;; A tamper-proof system for issuing and verifying academic certificates
+;; Features Certificate Authority (CA) Trust Scores for decentralized verification
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant ERR-UNAUTHORIZED (err u401))
@@ -7,6 +8,9 @@
 (define-constant ERR-ALREADY-EXISTS (err u409))
 (define-constant ERR-INVALID-INPUT (err u400))
 (define-constant ERR-CERTIFICATE-REVOKED (err u410))
+(define-constant ERR-VERIFIER-NOT-AUTHORIZED (err u109))
+(define-constant ERR-INSTITUTION-NOT-VERIFIED (err u110))
+(define-constant ERR-INVALID-VERIFIER (err u111))
 
 (define-data-var next-certificate-id uint u1)
 
@@ -51,6 +55,25 @@
     { certificate-id: uint }
     { event-id: uint }
 )
+
+(define-map registered-verifiers principal uint)
+
+(define-map institution-verifications
+    { institution: principal }
+    (list 100 {
+        verifier: principal,
+        timestamp: uint
+    })
+)
+
+(define-map institution-trust-scores
+    { institution: principal }
+    { score: uint, last-updated: uint }
+)
+
+(define-data-var verifier-registration-counter uint u0)
+
+(define-data-var verification-event-counter uint u0)
 
 (define-read-only (get-contract-owner)
     CONTRACT-OWNER
@@ -339,4 +362,142 @@
         is-valid: (is-certificate-valid cert-id),
         exists: (is-some (get-certificate cert-id))
     }
+)
+
+(define-read-only (is-registered-verifier (verifier principal))
+    (is-some (map-get? registered-verifiers verifier))
+)
+
+(define-read-only (get-total-registered-verifiers)
+    (var-get verifier-registration-counter)
+)
+
+(define-read-only (get-institution-verification-count (institution principal))
+    (let ((verifications (default-to (list) (map-get? institution-verifications { institution: institution }))))
+        (len verifications)
+    )
+)
+
+(define-read-only (get-institution-verifications (institution principal))
+    (default-to (list) (map-get? institution-verifications { institution: institution }))
+)
+
+(define-read-only (get-institution-trust-score (institution principal))
+    (let ((score-data (map-get? institution-trust-scores { institution: institution })))
+        (match score-data
+            score (get score score)
+            u0
+        )
+    )
+)
+
+(define-read-only (get-certificate-trust-score (certificate-id uint))
+    (match (get-certificate certificate-id)
+        certificate (get-institution-trust-score (get institution certificate))
+        u0
+    )
+)
+
+(define-public (register-verifier (verifier principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (not (is-registered-verifier verifier)) ERR-ALREADY-EXISTS)
+        (map-set registered-verifiers verifier stacks-block-height)
+        (var-set verifier-registration-counter (+ (var-get verifier-registration-counter) u1))
+        (ok true)
+    )
+)
+
+(define-public (unregister-verifier (verifier principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (is-registered-verifier verifier) ERR-NOT-FOUND)
+        (map-delete registered-verifiers verifier)
+        (var-set verifier-registration-counter (- (var-get verifier-registration-counter) u1))
+        (ok true)
+    )
+)
+
+(define-public (verify-institution (institution principal))
+    (let
+        (
+            (caller tx-sender)
+            (current-verifications (default-to (list) (map-get? institution-verifications { institution: institution })))
+        )
+        (asserts! (is-registered-verifier caller) ERR-VERIFIER-NOT-AUTHORIZED)
+        (asserts! (not (is-eq institution CONTRACT-OWNER)) ERR-INVALID-INPUT)
+        (let
+            (
+                (new-verification {
+                    verifier: caller,
+                    timestamp: stacks-block-height
+                })
+                (updated-verifications (unwrap-panic (as-max-len? (append current-verifications new-verification) u100)))
+            )
+            (map-set institution-verifications { institution: institution } updated-verifications)
+            (let
+                (
+                    (new-score (calculate-trust-score institution))
+                )
+                (map-set institution-trust-scores
+                    { institution: institution }
+                    { score: new-score, last-updated: stacks-block-height }
+                )
+                (var-set verification-event-counter (+ (var-get verification-event-counter) u1))
+                (ok new-score)
+            )
+        )
+    )
+)
+
+(define-public (revoke-institution-verification (institution principal))
+    (let
+        (
+            (caller tx-sender)
+            (current-verifications (default-to (list) (map-get? institution-verifications { institution: institution })))
+            (found (is-some (element-at current-verifications u0)))
+        )
+        (asserts! (is-registered-verifier caller) ERR-VERIFIER-NOT-AUTHORIZED)
+        (asserts! (> (len current-verifications) u0) ERR-NOT-FOUND)
+        (begin
+            (map-delete institution-verifications { institution: institution })
+            (map-delete institution-trust-scores { institution: institution })
+            (ok true)
+        )
+    )
+)
+
+(define-public (recalculate-institution-trust-score (institution principal))
+    (let
+        (
+            (new-score (calculate-trust-score institution))
+        )
+        (asserts! (> (get-institution-verification-count institution) u0) ERR-INSTITUTION-NOT-VERIFIED)
+        (map-set institution-trust-scores
+            { institution: institution }
+            { score: new-score, last-updated: stacks-block-height }
+        )
+        (ok new-score)
+    )
+)
+
+(define-private (calculate-trust-score (institution principal))
+    (let
+        (
+            (verifications (default-to (list) (map-get? institution-verifications { institution: institution })))
+            (verification-count (len verifications))
+            (current-block stacks-block-height)
+        )
+        (if (is-eq verification-count u0)
+            u0
+            (let
+                (
+                    (base-score (* verification-count u10))
+                    (age-factor (/ (if (> current-block u52560) (- current-block u52560) u0) u5256))
+                    (final-score (+ base-score age-factor))
+                )
+                (if (> final-score u100) u100 final-score)
+            )
+        )
+    )
 )
